@@ -61,12 +61,14 @@ pub const ChunkIterator = struct {
     pub const ParseError = error{
         /// Parsing failed due to insufficient data or invalid length.
         InvalidChunk,
+        /// Chunk type is not recognized, stop processing the remaining chunks.
+        UnrecognizedChunkType,
     };
 
     fn parseChunk(self: *ChunkIterator) ParseError!?Chunk {
         if (self.slice.len < 4) return error.InvalidChunk;
 
-        const chunk_type: ChunkType = @enumFromInt(self.slice[0]);
+        const chunk_type: ChunkType = @fromBackingInt(@intCast(self.slice[0]));
         const flags = self.slice[1];
         const length = std.mem.readInt(u16, self.slice[2..4], .big);
         const padded_length = std.mem.alignForward(u32, length, 4);
@@ -104,7 +106,7 @@ pub const ChunkIterator = struct {
             .reconfig => chunk = .{ .reconfig = ParameterIterator.init(self.slice[4..length]) },
             .@"error" => chunk = .{ .@"error" = ErrorIterator.init(self.slice[4..length]) },
             .heartbeat_ack, .ecne, .cwr => {},
-            _ => chunk = .{ .unrecognized = self.slice[0..length] },
+            _ => if (self.slice[0] & 0x80 == 0) return error.UnrecognizedChunkType,
         }
 
         self.slice = self.slice[padded_length..];
@@ -148,8 +150,6 @@ pub const Chunk = union(enum) {
     forward_tsn: ForwardTsn,
     reconfig: ParameterIterator,
     @"error": ErrorIterator,
-    /// The whole chunk without padding.
-    unrecognized: []const u8,
 };
 
 pub const Init = struct {
@@ -225,7 +225,7 @@ pub const Data = struct {
     pub fn write(self: *const Data, buffer: []u8) usize {
         const size = self.getSize();
 
-        buffer[0] = @intFromEnum(ChunkType.data);
+        buffer[0] = @backingInt(ChunkType.data);
         buffer[1] = @bitCast(self.flags);
         std.mem.writeInt(u16, buffer[2..4], @intCast(self.user_data.len + data_chunk_header_size), .big);
         std.mem.writeInt(u32, buffer[4..8], self.tsn, .big);
@@ -393,89 +393,33 @@ pub const Error = union(ErrorCode) {
     user_initiated_abort: []const u8,
     protocol_violation: []const u8,
 
-    pub fn writeNoUserDataErrorChunk(buffer: []u8, tsn: u32) error{WriteFailed}!usize {
-        var info: [4]u8 = undefined;
-        std.mem.writeInt(u32, &info, tsn, .big);
-        return writeChunk(buffer, .no_user_data, &info);
+    pub fn writeNoUserDataErrorBuffer(buffer: []u8, tsn: u32) usize {
+        std.mem.writeInt(u16, buffer[0..2], @backingInt(ErrorCode.no_user_data), .big);
+        std.mem.writeInt(u16, buffer[2..4], 8, .big);
+        std.mem.writeInt(u32, buffer[4..8], tsn, .big);
+        return 8;
     }
 
-    pub fn writeProtocolViolationErrorChunk(buffer: []u8) error{WriteFailed}!usize {
-        return writeChunk(buffer, .protocol_violation, &.{});
+    pub fn writeInvalidStreamIdErrorBuffer(buffer: []u8, stream_id: u16) usize {
+        std.mem.writeInt(u16, buffer[0..2], @backingInt(ErrorCode.invalid_stream_id), .big);
+        std.mem.writeInt(u16, buffer[2..4], 8, .big);
+        std.mem.writeInt(u16, buffer[4..6], stream_id, .big);
+        std.mem.writeInt(u16, buffer[6..8], 0, .big);
+        return 8;
     }
 
-    pub fn writeInvalidStreamIdErrorChunk(buffer: []u8, stream_id: u16) error{WriteFailed}!usize {
-        var info: [4]u8 = .{ 0, 0, 0, 0 }; // stream id + reserved
-        std.mem.writeInt(u16, info[0..2], stream_id, .big);
-        return writeChunk(buffer, .invalid_stream_id, &info);
+    test "Error.writeNoUserDataErrorBuffer" {
+        var buffer: [8]u8 = undefined;
+        const n = Error.writeNoUserDataErrorBuffer(&buffer, 0x12345678);
+        try std.testing.expectEqual(8, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x09, 0x00, 0x08, 0x12, 0x34, 0x56, 0x78 }, buffer[0..n]);
     }
 
-    pub fn writeUnrecognizedChunkErrorChunk(buffer: []u8, chunk: []const u8) error{WriteFailed}!usize {
-        return writeChunk(buffer, .unrecognized_chunk_type, chunk);
-    }
-
-    /// Writes an ERROR chunk holding a single cause and returns its size, padding included.
-    fn writeChunk(buffer: []u8, code: ErrorCode, info: []const u8) error{WriteFailed}!usize {
-        const length = 8 + info.len;
-        const size = std.mem.alignForward(usize, length, 4);
-        if (buffer.len < size) return error.WriteFailed;
-
-        buffer[0] = @intFromEnum(ChunkType.@"error");
-        buffer[1] = 0; // flags
-        std.mem.writeInt(u16, buffer[2..4], @intCast(length), .big);
-        std.mem.writeInt(u16, buffer[4..6], @intFromEnum(code), .big);
-        std.mem.writeInt(u16, buffer[6..8], @intCast(4 + info.len), .big);
-        @memcpy(buffer[8..length], info);
-        @memset(buffer[length..size], 0);
-        return size;
-    }
-
-    test "Error: write chunks" {
-        var buffer: [16]u8 = undefined;
-
-        // no user data
-        {
-            const n = try Error.writeNoUserDataErrorChunk(&buffer, 0x12345678);
-            try std.testing.expectEqualSlices(u8, &.{
-                0x09, 0x00, 0x00, 0x0C,
-                0x00, 0x09, 0x00, 0x08,
-                0x12, 0x34, 0x56, 0x78,
-            }, buffer[0..n]);
-        }
-
-        // protocol violation
-        {
-            const n = try Error.writeProtocolViolationErrorChunk(&buffer);
-            try std.testing.expectEqualSlices(u8, &.{ 0x09, 0x00, 0x00, 0x08, 0x00, 0x0D, 0x00, 0x04 }, buffer[0..n]);
-        }
-
-        // invalid stream id
-        {
-            const n = try Error.writeInvalidStreamIdErrorChunk(&buffer, 0x1234);
-            try std.testing.expectEqualSlices(u8, &.{
-                0x09, 0x00, 0x00, 0x0C,
-                0x00, 0x01, 0x00, 0x08,
-                0x12, 0x34, 0x00, 0x00,
-            }, buffer[0..n]);
-        }
-
-        // unrecognized chunk, padded
-        {
-            const n = try Error.writeUnrecognizedChunkErrorChunk(&buffer, &.{ 0xC1, 0x00, 0x00, 0x05, 0xAA });
-            try std.testing.expectEqualSlices(u8, &.{
-                0x09, 0x00, 0x00, 0x0D,
-                0x00, 0x06, 0x00, 0x09,
-                0xC1, 0x00, 0x00, 0x05,
-                0xAA, 0x00, 0x00, 0x00,
-            }, buffer[0..n]);
-        }
-
-        // buffer too small, the padding counts
-        {
-            try std.testing.expectError(error.WriteFailed, Error.writeNoUserDataErrorChunk(buffer[0..11], 0));
-            try std.testing.expectError(error.WriteFailed, Error.writeProtocolViolationErrorChunk(buffer[0..7]));
-            try std.testing.expectError(error.WriteFailed, Error.writeInvalidStreamIdErrorChunk(buffer[0..11], 0));
-            try std.testing.expectError(error.WriteFailed, Error.writeUnrecognizedChunkErrorChunk(buffer[0..15], &.{ 0xC1, 0x00, 0x00, 0x05, 0xAA }));
-        }
+    test "Error.writeInvalidStreamIdErrorBuffer" {
+        var buffer: [8]u8 = undefined;
+        const n = Error.writeInvalidStreamIdErrorBuffer(&buffer, 0x1234);
+        try std.testing.expectEqual(8, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x08, 0x12, 0x34, 0x00, 0x00 }, buffer[0..n]);
     }
 };
 
@@ -494,7 +438,7 @@ pub const ErrorIterator = struct {
             const length = std.mem.readInt(u16, self.slice[2..4], .big);
             const padded_length = std.mem.alignForward(u32, length, 4);
             if (length < 4 or length > self.slice.len) return error.InvalidParameter;
-            const err: ErrorCode = @enumFromInt(error_code);
+            const err: ErrorCode = @fromBackingInt(@intCast(error_code));
 
             defer self.slice = if (self.slice.len >= padded_length) self.slice[padded_length..] else self.slice[length..];
             return switch (err) {
@@ -643,11 +587,11 @@ pub const ReConfigResponse = struct {
         if (data.len != 8 and data.len != 16) return error.InvalidParameter;
 
         const result = std.mem.readInt(u32, data[4..8], .big);
-        if (result > @intFromEnum(Result.in_progress)) return error.InvalidParameter;
+        if (result > @backingInt(Result.in_progress)) return error.InvalidParameter;
 
         return ReConfigResponse{
             .resp_seq_num = std.mem.readInt(u32, data[0..4], .big),
-            .result = @enumFromInt(result),
+            .result = @fromBackingInt(@intCast(result)),
             .sender_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[8..12], .big) else null,
             .receiver_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[12..16], .big) else null,
         };
@@ -669,15 +613,19 @@ pub const Parameter = union(enum) {
             .heartbeat_info => |value| writeTLV(ParameterType.heartbeat_info, value, buffer),
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
             .supported_extensions => |value| writeTLV(ParameterType.supported_extensions, std.mem.sliceAsBytes(value), buffer),
+<<<<<<< Updated upstream
+=======
+            .unknown => |param| writeTLV(@fromBackingInt(@intCast(param.param_type)), param.value, buffer),
+>>>>>>> Stashed changes
             .reconfig_response => |resp| blk: {
                 std.debug.assert((resp.sender_next_tsn == null) == (resp.receiver_next_tsn == null));
                 const size: usize = if (resp.sender_next_tsn != null) 16 else 8;
                 if (size + 4 > buffer.len) return error.WriteFailed;
 
-                std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ParameterType.reconfig_response), .big);
+                std.mem.writeInt(u16, buffer[0..2], @backingInt(ParameterType.reconfig_response), .big);
                 std.mem.writeInt(u16, buffer[2..4], @intCast(size + 4), .big);
                 std.mem.writeInt(u32, buffer[4..8], resp.resp_seq_num, .big);
-                std.mem.writeInt(u32, buffer[8..12], @intFromEnum(resp.result), .big);
+                std.mem.writeInt(u32, buffer[8..12], @backingInt(resp.result), .big);
                 if (resp.sender_next_tsn) |_| {
                     std.mem.writeInt(u32, buffer[12..16], resp.sender_next_tsn.?, .big);
                     std.mem.writeInt(u32, buffer[16..20], resp.receiver_next_tsn.?, .big);
@@ -695,7 +643,7 @@ pub const Parameter = union(enum) {
         const total_size = std.mem.alignForward(usize, data.len + 4, 4);
         if (buffer.len < total_size) return error.WriteFailed;
 
-        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(typ), .big);
+        std.mem.writeInt(u16, buffer[0..2], @backingInt(typ), .big);
         std.mem.writeInt(u16, buffer[2..4], @intCast(data.len + 4), .big);
         @memcpy(buffer[4..][0..data.len], data);
         @memset(buffer[4 + data.len .. total_size], 0);
@@ -714,7 +662,7 @@ pub const ParameterIterator = struct {
         if (self.slice.len == 0) return null;
         if (self.slice.len < 4) return error.InvalidParameter;
 
-        const param_type: ParameterType = @enumFromInt(std.mem.readInt(u16, self.slice[0..2], .big));
+        const param_type: ParameterType = @fromBackingInt(@intCast(std.mem.readInt(u16, self.slice[0..2], .big)));
         const length = std.mem.readInt(u16, self.slice[2..4], .big);
         const padded_length = (length + 3) & ~@as(u16, 3); // Align to 4 bytes
 
@@ -734,7 +682,7 @@ pub const ParameterIterator = struct {
                 break :blk .forward_tsn_supported;
             },
             .supported_extensions => .{ .supported_extensions = std.mem.bytesAsSlice(ChunkType, value) },
-            else => .{ .unknown = .{ .param_type = @intFromEnum(param_type), .value = value } },
+            else => .{ .unknown = .{ .param_type = @backingInt(param_type), .value = value } },
         };
     }
 };
@@ -1007,16 +955,24 @@ test "ChunkIterator: parse hearbeat" {
     try std.testing.expectEqualSlices(u8, data[8..15], chunk.heartbeat);
 }
 
-test "ChunkIterator: returns unrecognized chunks without padding" {
+test "ChunkIterator: skips unrecognized chunk with high bit set" {
     const data = [_]u8{
         0x80, 0x00, 0x00, 0x05, 0xAA, 0x00, 0x00, 0x00,
         0x0B, 0x00, 0x00, 0x04,
     };
 
     var it = ChunkIterator.init(data[0..]);
-    try std.testing.expectEqualSlices(u8, data[0..5], (try it.next()).?.unrecognized);
-    try std.testing.expect((try it.next()).? == .cookie_ack);
+    const chunk = (try it.next()).?;
+
+    try std.testing.expect(chunk == .cookie_ack);
     try std.testing.expectEqual(null, try it.next());
+}
+
+test "ChunkIterator: stops on unrecognized chunk with high bit clear" {
+    const data = [_]u8{ 0x40, 0x00, 0x00, 0x04, 0x0B, 0x00, 0x00, 0x04 };
+
+    var it = ChunkIterator.init(data[0..]);
+    try std.testing.expectError(error.UnrecognizedChunkType, it.next());
 }
 
 test "ChunkIterator: skips known unhandled chunks" {
@@ -1068,8 +1024,8 @@ test "ParameterIterator: rejects lengths shorter than the header" {
 
 test "ParameterIterator: round-trip supported extensions parameter" {
     const data = [_]u8{
-        0x80,                                  0x08,                             0x00,                               0x07,
-        @intFromEnum(ChunkType.heartbeat_ack), @intFromEnum(ChunkType.shutdown), @intFromEnum(ChunkType.cookie_ack), 0,
+        0x80,                                 0x08,                            0x00,                              0x07,
+        @backingInt(ChunkType.heartbeat_ack), @backingInt(ChunkType.shutdown), @backingInt(ChunkType.cookie_ack), 0,
     };
 
     var it = ParameterIterator.init(data[0..]);

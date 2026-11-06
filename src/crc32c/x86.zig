@@ -10,7 +10,7 @@ const std = @import("std");
 
 const Crc32c = @This();
 
-const Soft = std.hash.crc.Crc(u32, .{
+const Soft = std.hash.crc.Generic(u32, .{
     .polynomial = 0x1EDC6F41,
     .initial = 0xffffffff,
     .reflect_input = true,
