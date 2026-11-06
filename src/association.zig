@@ -21,7 +21,9 @@ pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 pub const Extensions = packed struct(u8) {
     /// If `true`, the association will negotiate stream reset reconfiguration (RFC6525).
     stream_reconfiguration: bool = false,
-    _pad: u7 = 0,
+    /// If `true`, the association will negotiate partial reliability (RFC3758).
+    partial_reliability: bool = false,
+    _pad: u6 = 0,
 
     fn fromChunks(chunks: []const message.ChunkType) Extensions {
         var extensions: Extensions = .{};
@@ -38,8 +40,19 @@ pub const Extensions = packed struct(u8) {
 
     // The parameter is at most 8 bytes and the smallest buffer we can write to is 128 bytes, so this should never fail.
     fn write(extensions: Extensions, buffer: []u8) usize {
-        if (!extensions.stream_reconfiguration) return 0;
-        return message.Parameter.writeBuffer(.{ .supported_extensions = &.{.reconfig} }, buffer) catch unreachable;
+        var written: usize = 0;
+        if (extensions.stream_reconfiguration) {
+            written += message.Parameter.writeBuffer(
+                .{ .supported_extensions = &.{.reconfig} },
+                buffer,
+            ) catch unreachable;
+        }
+
+        if (extensions.partial_reliability) {
+            written += message.Parameter.writeBuffer(.forward_tsn_supported, buffer[written..]) catch unreachable;
+        }
+
+        return written;
     }
 };
 
@@ -119,6 +132,7 @@ const Transmit = union(enum) {
     shutdown_ack,
     shutdown_complete: ?u32,
     invalid_stream_error: u16,
+    unknown_chunk_error: []const u8,
 };
 
 const RetransmissionTimer = struct {
@@ -305,6 +319,10 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
 }
 
 pub fn deinit(self: *Association) void {
+    while (self.transmits.popBack()) |transmit| switch (transmit) {
+        .unknown_chunk_error => |data| self.allocator.free(data),
+        else => {},
+    };
     self.transmits.deinit(self.allocator);
     self.events.deinit(self.allocator);
     self.message_assembler.deinit(self.allocator);
@@ -330,7 +348,10 @@ pub fn shutdown(self: *Association) Error!void {
 /// Closes the association immediately, queued data is dropped and a single ABORT chunk is sent to the peer.
 pub fn abort(self: *Association) void {
     if (self.state == .closed) return;
-    while (self.transmits.popFront()) |_| {}
+    while (self.transmits.popFront()) |transmit| switch (transmit) {
+        .unknown_chunk_error => |data| self.allocator.free(data),
+        else => {},
+    };
     self.pending_sack = false;
     if (self.peer_verification_tag != 0) self.transmits.pushBack(self.allocator, .user_abort) catch {};
     self.resetToClosed();
@@ -352,17 +373,23 @@ pub fn resetStreams(self: *Association, streams: []const u16, direction: StreamR
     self.stream_reset.maybeStartTransmitting(&self.message_queue);
 }
 
+pub const HandleWriteError = error{ UnsupportedExtension, InvalidState, InvalidStream } || std.mem.Allocator.Error;
+
 /// Write a message to the association.
 ///
 /// The `data` is copied internally.
-pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) (Error || error{InvalidStream})!void {
+pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) HandleWriteError!void {
     std.debug.assert(data.len > 0);
+    if (options.policy != .reliable and !self.negotiated_extensions.partial_reliability) return error.UnsupportedExtension;
     switch (self.state) {
         .established, .cookie_wait, .cookie_echoed => {},
         else => return error.InvalidState,
     }
+
     if (options.stream_id >= self.outbound_streams) return error.InvalidStream;
+
     if (!try self.stream_reset.bufferMessage(self.allocator, data, options)) {
+        @branchHint(.likely);
         try self.message_queue.pushData(self.allocator, data, options);
     }
 }
@@ -389,27 +416,28 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
     var chunk_it = packet.iterateChunks();
     var received_data = false;
     var immediate_sack = false;
+    var reported_chunk = false;
     while (true) {
-        const chunk = chunk_it.next() catch |err| switch (err) {
-            error.InvalidChunk => break,
-            error.UnrecognizedChunkType => {
-                if (self.state != .closed or packet.verification_tag == 0) break; // send error chunk
-                try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
-                return null;
-            },
-        } orelse break;
+        const chunk = chunk_it.next() catch break orelse break;
 
         // RFC9260 - 8.5.1. (A)
         if (packet.verification_tag == 0 and chunk != .init) break;
 
         // RFC9260 - 8.4. (8)
-        if (self.state == .closed) switch (chunk) {
-            .data, .init_ack, .sack, .heartbeat, .shutdown => {
-                try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
-                return null;
-            },
-            else => {},
-        };
+        if (self.state == .closed) {
+            @branchHint(.unlikely);
+            switch (chunk) {
+                .data, .init_ack, .sack, .heartbeat, .shutdown => {
+                    try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
+                    return null;
+                },
+                .unrecognized => |raw| if (raw[0] & 0x80 == 0) {
+                    try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
+                    return null;
+                },
+                else => {},
+            }
+        }
 
         switch (chunk) {
             // the tag is only checked against the first chunk of the packet
@@ -432,13 +460,13 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 if (packet.verification_tag != self.verification_tag or !std.mem.eql(u8, cookie, &self.cookie)) break;
 
                 self.transmits.pushBackAssumeCapacity(.cookie_ack);
-                if (self.state == .closed or self.state == .cookie_wait) try self.setStateToEstablished();
+                if (self.beforePeerInit()) try self.setStateToEstablished();
             },
             .cookie_ack => if (self.state == .cookie_echoed) try self.setStateToEstablished(),
             .data => |d| {
-                switch (self.state) {
-                    .established, .shutdown_pending, .shutdown_sent => {},
-                    else => break,
+                if (!self.acceptData()) {
+                    @branchHint(.unlikely);
+                    continue;
                 }
 
                 if (d.stream_id >= self.inbound_streams) {
@@ -477,6 +505,12 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 return null;
             },
             .forward_tsn => |fwd_tsn| {
+                if (!self.negotiated_extensions.partial_reliability) {
+                    try self.pushForwardTsnError(&fwd_tsn, &reported_chunk);
+                    continue;
+                }
+                if (!self.acceptData()) continue;
+
                 self.message_assembler.handleForwardTsn(self.allocator, &fwd_tsn) catch |err| switch (err) {
                     error.ProtocolViolation => {
                         try self.transmits.pushBack(self.allocator, .protocol_violation_abort);
@@ -507,6 +541,13 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 };
             },
             .@"error" => {},
+            // RFC9260 - 3.2. the two upper bits of the type tell whether to report the chunk and whether to stop
+            .unrecognized => |raw| {
+                if (raw[0] & 0x40 != 0) {
+                    if (try self.reserveUnrecognizedChunkError(raw.len, &reported_chunk)) |copy| @memcpy(copy, raw);
+                }
+                if (raw[0] & 0x80 == 0) break;
+            },
         }
     }
 
@@ -664,6 +705,47 @@ pub fn pollTimeout(self: *Association) ?i64 {
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
+fn acceptData(self: *const Association) bool {
+    return switch (self.state) {
+        .established, .shutdown_pending, .shutdown_sent => true,
+        else => false,
+    };
+}
+
+fn beforeEstablished(self: *const Association) bool {
+    return switch (self.state) {
+        .closed, .cookie_wait, .cookie_echoed => true,
+        else => false,
+    };
+}
+
+/// No INIT or INIT ACK received from the peer yet.
+fn beforePeerInit(self: *const Association) bool {
+    return self.state == .closed or self.state == .cookie_wait;
+}
+
+fn pushForwardTsnError(self: *Association, fwd_tsn: *const message.ForwardTsn, reported_chunk: *bool) !void {
+    const length = 8 + fwd_tsn.streams.len;
+    const chunk = try self.reserveUnrecognizedChunkError(length, reported_chunk) orelse return;
+    chunk[0] = @intFromEnum(message.ChunkType.forward_tsn);
+    chunk[1] = 0;
+    std.mem.writeInt(u16, chunk[2..4], @intCast(length), .big);
+    std.mem.writeInt(u32, chunk[4..8], fwd_tsn.new_cumulative_tsn, .big);
+    @memcpy(chunk[8..], fwd_tsn.streams);
+}
+
+fn reserveUnrecognizedChunkError(self: *Association, length: usize, reported_chunk: *bool) error{OutOfMemory}!?[]u8 {
+    if (reported_chunk.* or self.state == .closed or self.peer_verification_tag == 0) return null;
+    // ERROR chunk header + cause header + reported chunk
+    if (std.mem.alignForward(usize, 8 + length, 4) > message.PMDCS) return null;
+
+    try self.transmits.ensureUnusedCapacity(self.allocator, 1);
+    const chunk = try self.allocator.alloc(u8, length);
+    self.transmits.pushBackAssumeCapacity(.{ .unknown_chunk_error = chunk });
+    reported_chunk.* = true;
+    return chunk;
+}
+
 fn nextChunk(
     self: *Association,
     buffer: []u8,
@@ -672,6 +754,7 @@ fn nextChunk(
     can_fragment: bool,
 ) TransmitError!?struct { ?Transmit, usize } {
     if (self.fast_retransmit) {
+        @branchHint(.unlikely);
         if (self.nextFastRetransmit(buffer, now) catch |err| {
             if (first_chunk) return err;
             self.fast_retransmit = false;
@@ -693,7 +776,10 @@ fn nextChunk(
 
         if (self.message_queue.flight_size >= self.cwnd) return null;
 
-        if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        if (self.fast_recovery) {
+            @branchHint(.unlikely);
+            if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        }
         if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
         const result = try self.message_queue.nextChunk(self.allocator, buffer, can_fragment, now) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
@@ -717,7 +803,7 @@ fn nextChunk(
         .init_ack => self.writeInitAck(buffer),
         .cookie_echo => |cookie| try writeCookieEcho(cookie, buffer),
         .cookie_ack => self.writeCookieAck(buffer),
-        .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer),
+        .abort => |tsn| writeNoUserDataAbort(buffer, tsn),
         .protocol_violation_abort => writeProtocolViolationAbort(buffer),
         .user_abort => writeAbort(buffer),
         .ootb_abort => writeReflectedAbort(buffer),
@@ -726,7 +812,12 @@ fn nextChunk(
         .shutdown => |tsn| writeShutdown(buffer, tsn),
         .shutdown_ack => writeShutdownAck(buffer),
         .shutdown_complete => |reflected_tag| writeShutdownComplete(buffer, reflected_tag != null),
-        .invalid_stream_error => |stream_id| message.Error.writeInvalidStreamIdErrorBuffer(buffer, stream_id),
+        .invalid_stream_error => |stream_id| message.Error.writeInvalidStreamIdErrorChunk(buffer, stream_id) catch unreachable,
+        .unknown_chunk_error => |chunk| blk: {
+            const written = try message.Error.writeUnrecognizedChunkErrorChunk(buffer, chunk);
+            self.allocator.free(chunk);
+            break :blk written;
+        },
     };
 
     switch (chunk_type) {
@@ -798,7 +889,7 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
     const supported_extensions = try getPeerSupportedExtensions(chunk);
     try self.transmits.pushBack(self.allocator, .{ .init_ack = chunk.initiate_tag });
 
-    if (self.state == .closed or self.state == .cookie_wait) {
+    if (self.beforePeerInit()) {
         self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
         self.message_assembler.setInitTsn(chunk.initial_tsn);
@@ -819,6 +910,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     while (try it.next()) |param| switch (param) {
         .state_cookie => |value| cookie_param = value,
         .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
+        .forward_tsn_supported => supported_extensions.partial_reliability = true,
         else => {},
     };
     const cookie = cookie_param orelse return error.MissingCookie;
@@ -854,6 +946,7 @@ fn getPeerSupportedExtensions(chunk: message.Init) !Extensions {
     var it = chunk.iterateParameters();
     while (try it.next()) |param| switch (param) {
         .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
+        .forward_tsn_supported => supported_extensions.partial_reliability = true,
         else => {},
     };
 
@@ -886,6 +979,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
             self.fast_recovery_exit_tsn = 0;
         }
     } else if (result.has_fast_retransmit) {
+        @branchHint(.unlikely);
         self.fast_recovery = true;
         self.fast_retransmit = true;
         self.fast_recovery_exit_tsn = self.message_queue.highestTsnSent();
@@ -928,8 +1022,9 @@ fn handleShutdownAck(self: *Association, verification_tag: u32) !void {
             try self.setStateToClosed();
         },
         // RFC9260 - 8.5.1. (E) a shutdown ack received before the association is established is out of the blue
-        .closed, .cookie_wait, .cookie_echoed => try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = verification_tag }),
-        else => return,
+        else => if (self.beforeEstablished()) {
+            try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = verification_tag });
+        },
     }
 }
 
@@ -991,10 +1086,7 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
     return switch (@as(message.ChunkType, @enumFromInt(packet.chunks[0]))) {
         .init => packet.verification_tag == 0,
         .abort, .shutdown_complete => packet.verification_tag == if (reflected) self.peer_verification_tag else self.verification_tag,
-        .shutdown_ack => switch (self.state) {
-            .closed, .cookie_wait, .cookie_echoed => true,
-            else => packet.verification_tag == self.verification_tag,
-        },
+        .shutdown_ack => self.beforeEstablished() or packet.verification_tag == self.verification_tag,
         // RFC9260 - 8.4. out of the blue packets have no association to check the tag against
         else => self.state == .closed or packet.verification_tag == self.verification_tag,
     };
@@ -1076,14 +1168,17 @@ fn writeCookieAck(self: *Association, buffer: []u8) usize {
     return 4;
 }
 
-fn writeNoUserDataAbort(self: *Association, tsn: u32, buffer: []u8) usize {
-    _ = self;
+// An ABORT with a single cause has the layout of an ERROR chunk, only the type differs.
+fn writeNoUserDataAbort(buffer: []u8, tsn: u32) usize {
+    const written = message.Error.writeNoUserDataErrorChunk(buffer, tsn) catch unreachable;
     buffer[0] = @intFromEnum(message.ChunkType.abort);
-    buffer[1] = 0; // flags
-    const written = message.Error.writeNoUserDataErrorBuffer(buffer[4..], tsn);
-    std.mem.writeInt(u16, buffer[2..4], @intCast(4 + written), .big);
+    return written;
+}
 
-    return 4 + written;
+fn writeProtocolViolationAbort(buffer: []u8) usize {
+    const written = message.Error.writeProtocolViolationErrorChunk(buffer) catch unreachable;
+    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    return written;
 }
 
 fn writeHeartbeatAck(data: []const u8, buffer: []u8) !usize {
@@ -1107,14 +1202,6 @@ fn writeShutdownAck(buffer: []u8) usize {
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
-}
-
-fn writeProtocolViolationAbort(buffer: []u8) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.abort);
-    buffer[1] = 0; // flags
-    const written = message.Error.writeProtocolViolationErrorBuffer(buffer[4..]);
-    std.mem.writeInt(u16, buffer[2..4], @intCast(4 + written), .big);
-    return 4 + written;
 }
 
 fn writeAbort(buffer: []u8) usize {
@@ -1284,6 +1371,55 @@ fn testReconfigPacket(assoc: *const Association, buffer: []u8, params: []const u
     @memset(buffer[message.packet_header_size + 4 + params.len .. size], 0);
     Helper.checkSum(buffer[0..size]);
     return buffer[0..size];
+}
+
+fn testPacketFromRawChunks(assoc: *const Association, buffer: []u8, chunks: []const u8) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    @memcpy(buffer[message.packet_header_size..][0..chunks.len], chunks);
+    const packet = buffer[0 .. message.packet_header_size + chunks.len];
+    Helper.checkSum(packet);
+    return packet;
+}
+
+test "Association: negotiate extensions" {
+    var buffer: [message.PMDCS]u8 = undefined;
+
+    const cases = comptime blk: {
+        var result: [16][3][2]bool = undefined;
+        for (&result, 0..) |*case, i| {
+            const a = [2]bool{ (i & 1) != 0, (i & 2) != 0 };
+            const b = [2]bool{ (i & 4) != 0, (i & 8) != 0 };
+            case.* = .{ a, b, .{ a[0] and b[0], a[1] and b[1] } };
+        }
+        break :blk result;
+    };
+
+    for (cases) |case| {
+        var assoc1 = testAssoc();
+        defer assoc1.deinit();
+
+        var assoc2 = testAssoc();
+        defer assoc2.deinit();
+
+        assoc1.supported_extensions = .{ .partial_reliability = case[0][1], .stream_reconfiguration = case[0][0] };
+        assoc2.supported_extensions = .{ .partial_reliability = case[1][1], .stream_reconfiguration = case[1][0] };
+
+        try assoc1.connect();
+        var packet = try assoc1.pollTransmit(&buffer, 0) orelse return error.UnexpectedFailedTest;
+        _ = try assoc2.handleRead(packet, 0);
+
+        packet = try assoc2.pollTransmit(&buffer, 0) orelse return error.UnexpectedFailedTest;
+        _ = try assoc1.handleRead(packet, 0);
+
+        packet = try assoc1.pollTransmit(&buffer, 0) orelse return error.UnexpectedFailedTest;
+        _ = try assoc2.handleRead(packet, 0);
+
+        try testing.expectEqual(assoc1.negotiated_extensions, assoc2.negotiated_extensions);
+        try testing.expectEqual(case[2][0], assoc1.negotiated_extensions.stream_reconfiguration);
+        try testing.expectEqual(case[2][0], assoc2.negotiated_extensions.stream_reconfiguration);
+        try testing.expectEqual(case[2][1], assoc1.negotiated_extensions.partial_reliability);
+        try testing.expectEqual(case[2][1], assoc2.negotiated_extensions.partial_reliability);
+    }
 }
 
 test "Association.pollTransmits: a timed out message that was gap acked is not retransmitted" {
@@ -1961,6 +2097,66 @@ test "Association.handleRead: data on an invalid stream is acknowledged and answ
     try testing.expectEqual(0, (try testRead(&assoc, packet, 0, &lens)).len);
     try testing.expectEqual(Transmit{ .invalid_stream_error = 5 }, assoc.transmits.popFront().?);
     try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
+}
+
+test "Association.handleRead: unrecognized chunks are reported with an error" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    const forward_tsn = [_]u8{ 0xC0, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x02 };
+    const heartbeat = [_]u8{ 0x04, 0x00, 0x00, 0x0C, 0x00, 0x01, 0x00, 0x08, 0xAA, 0xBB, 0xCC, 0xDD };
+    var buffer: [message.MTU]u8 = undefined;
+    var lens: [1]usize = undefined;
+
+    // forward tsn without partial reliability, only the first chunk of the packet is reported
+    {
+        const unrecognized = [_]u8{ 0xC1, 0x00, 0x00, 0x04 };
+        const packet = testPacketFromRawChunks(&assoc, &buffer, &(forward_tsn ++ unrecognized ++ heartbeat));
+        _ = try testRead(&assoc, packet, 0, &lens);
+        try testing.expectEqualSlices(u8, &forward_tsn, assoc.transmits.at(0).unknown_chunk_error);
+        try testing.expectEqual(Transmit.heartbeat_ack, std.meta.activeTag(assoc.transmits.at(1)));
+        try testing.expectEqual(2, assoc.transmits.len);
+
+        var out: [message.MTU]u8 = undefined;
+        const sent = (try assoc.pollTransmit(&out, 0)).?;
+        try testing.expectEqualSlices(u8, &([_]u8{ 0x09, 0x00, 0x00, 0x14, 0x00, 0x06, 0x00, 0x10 } ++ forward_tsn), sent[message.packet_header_size..][0..20]);
+        try testing.expectEqual(0, assoc.transmits.len);
+    }
+
+    // an error larger than the caller's buffer fails to write, but always fits in a MTU buffer
+    {
+        var large: [8 + 4 * 50]u8 = @splat(0);
+        @memcpy(large[0..8], forward_tsn[0..8]);
+        std.mem.writeInt(u16, large[2..4], large.len, .big);
+        _ = try testRead(&assoc, testPacketFromRawChunks(&assoc, &buffer, &large), 0, &lens);
+
+        var small: [message.packet_header_size + min_buffer_size]u8 = undefined;
+        try testing.expectError(error.WriteFailed, assoc.pollTransmit(&small, 0));
+        try testing.expectEqual(1, assoc.transmits.len);
+
+        var out: [message.MTU]u8 = undefined;
+        _ = (try assoc.pollTransmit(&out, 0)).?;
+        try testing.expectEqual(0, assoc.transmits.len);
+    }
+
+    // the two upper bits of the type: stop (00, 01) or skip (10, 11), report (01, 11) or not (00, 10)
+    for ([_]struct { u8, bool, bool }{
+        .{ 0x3F, false, false },
+        .{ 0x7F, false, true },
+        .{ 0xBF, true, false },
+        .{ 0xFF, true, true },
+    }) |case| {
+        const chunk_type, const skip, const report = case;
+        const packet = testPacketFromRawChunks(&assoc, &buffer, &([_]u8{ chunk_type, 0x00, 0x00, 0x04 } ++ heartbeat));
+        _ = try testRead(&assoc, packet, 0, &lens);
+        if (report) {
+            const reported = assoc.transmits.popFront().?.unknown_chunk_error;
+            defer testing.allocator.free(reported);
+            try testing.expectEqualSlices(u8, &.{ chunk_type, 0x00, 0x00, 0x04 }, reported);
+        }
+        if (skip) try testing.expectEqual(Transmit.heartbeat_ack, std.meta.activeTag(assoc.transmits.popFront().?));
+        try testing.expectEqual(0, assoc.transmits.len);
+    }
 }
 
 test "Association.handleRead: only one sack is queued until it is sent" {

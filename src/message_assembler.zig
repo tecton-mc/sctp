@@ -104,7 +104,10 @@ pub fn setInitTsn(self: *MessageAssembler, init_tsn: u32) void {
 }
 
 pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) ReceiveError!bool {
-    if (d.user_data.len == 0) return error.NoUserData;
+    if (d.user_data.len == 0) {
+        @branchHint(.cold);
+        return error.NoUserData;
+    }
     self.sack_generator.checkTsn(d.tsn) catch |err| return err == error.Duplicate;
 
     if (d.tsn -% self.lowest_held_tsn >= bitmap_bits) {
@@ -1026,5 +1029,42 @@ test "MessageAssembler.receiveData: a message abandoned while being fragmented d
         for (order) |i| _ = try r.receiveData(testing.allocator, chunks[i]);
         try testExpectReady(&r, &.{"bb"});
         try testing.expectEqual(3, r.getCumulativeTsn());
+    }
+}
+
+test "MessageAssembler.receiveData: boundary window" {
+    // a message completing a window above a waiting start keeps it
+    {
+        var r: MessageAssembler = .init(1 << 20);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(0, 1, 0, .unordered_complete, "x"));
+        _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .start_frag, "a"));
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .middle_frag, "b"));
+        var tsn: u32 = 4;
+        while (tsn < 1024) : (tsn += 1) _ = try r.receiveData(testing.allocator, testData(tsn, 1, 0, .unordered_complete, "x"));
+        _ = try r.receiveData(testing.allocator, testData(1024, 1, 0, .unordered_start_frag, "y"));
+        _ = try r.receiveData(testing.allocator, testData(1025, 1, 0, .unordered_end_frag, "z"));
+        while (r.drainReady(testing.allocator)) |_| {}
+        _ = try r.receiveData(testing.allocator, testData(3, 0, 0, .end_frag, "c"));
+        try testExpectReady(&r, &.{"abc"});
+        // 1025 was refused, its retransmission completes the message
+        _ = try r.receiveData(testing.allocator, testData(1025, 1, 0, .unordered_end_frag, "z"));
+        try testExpectReady(&r, &.{"yz"});
+    }
+    // a fragment a window above a received middle of a waiting message
+    {
+        var r: MessageAssembler = .init(1 << 20);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(0, 1, 0, .unordered_complete, "x"));
+        _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .start_frag, "a"));
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .middle_frag, "b"));
+        _ = try r.receiveData(testing.allocator, testData(3, 0, 0, .middle_frag, "c"));
+        _ = try r.receiveData(testing.allocator, testData(5, 0, 0, .end_frag, "e"));
+        var tsn: u32 = 6;
+        while (tsn < 1026) : (tsn += 1) _ = try r.receiveData(testing.allocator, testData(tsn, 1, 0, .unordered_complete, "x"));
+        _ = try r.receiveData(testing.allocator, testData(1026, 1, 0, .unordered_start_frag, "y"));
+        while (r.drainReady(testing.allocator)) |_| {}
+        _ = try r.receiveData(testing.allocator, testData(4, 0, 0, .middle_frag, "d"));
+        try testExpectReady(&r, &.{"abcde"});
     }
 }
